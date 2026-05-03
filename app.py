@@ -7,21 +7,38 @@ from datetime import datetime, timedelta, date
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
+from urllib.parse import urlparse
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)
 
+# Database configuration
+DATABASE_URL = os.environ.get('DATABASE_URL')
 DB_PATH = os.environ.get('DB_PATH', 'taskflow.db')
 JWT_SECRET = os.environ.get('JWT_SECRET', 'taskflow-secret-2024')
 JWT_ALGO = 'HS256'
 
+# Determine database type
+USE_POSTGRES = DATABASE_URL is not None
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    # Fix Railway's postgres:// to postgresql://
+    if DATABASE_URL.startswith('postgres://'):
+        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
 # ─── DB ────────────────────────────────────────────────────────────────────
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute('PRAGMA foreign_keys = ON')
-        g.db.execute('PRAGMA journal_mode = WAL')
+        if USE_POSTGRES:
+            g.db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            g.db.autocommit = False
+        else:
+            g.db = sqlite3.connect(DB_PATH)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute('PRAGMA foreign_keys = ON')
+            g.db.execute('PRAGMA journal_mode = WAL')
     return g.db
 
 @app.teardown_appcontext
@@ -32,58 +49,121 @@ def close_db(e=None):
 
 def init_db():
     with app.app_context():
-        db = sqlite3.connect(DB_PATH)
-        db.execute('PRAGMA foreign_keys = ON')
-        db.executescript('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
-                avatar TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                color TEXT DEFAULT '#6366f1',
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS project_members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
-                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(project_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','review','done')),
-                priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','urgent')),
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                creator_id INTEGER NOT NULL REFERENCES users(id),
-                due_date DATE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS task_comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        ''')
-        db.commit()
-        db.close()
+        if USE_POSTGRES:
+            db = psycopg2.connect(DATABASE_URL)
+            db.autocommit = True
+            cursor = db.cursor()
+            
+            # PostgreSQL schema
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                    avatar TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE TABLE IF NOT EXISTS projects (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    color TEXT DEFAULT '#6366f1',
+                    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE TABLE IF NOT EXISTS project_members (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(project_id, user_id)
+                );
+                
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','review','done')),
+                    priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','urgent')),
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    creator_id INTEGER NOT NULL REFERENCES users(id),
+                    due_date DATE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE TABLE IF NOT EXISTS task_comments (
+                    id SERIAL PRIMARY KEY,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
+            
+            cursor.close()
+            db.close()
+        else:
+            # SQLite schema
+            db = sqlite3.connect(DB_PATH)
+            db.execute('PRAGMA foreign_keys = ON')
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                    avatar TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    color TEXT DEFAULT '#6366f1',
+                    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS project_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(project_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','review','done')),
+                    priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','urgent')),
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    creator_id INTEGER NOT NULL REFERENCES users(id),
+                    due_date DATE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
+            db.commit()
+            db.close()
 
 def row_to_dict(row):
     if row is None:
@@ -564,61 +644,124 @@ def spa(path):
 # ─── SEED ────────────────────────────────────────────────────────────────────
 def seed_demo():
     with app.app_context():
-        db = sqlite3.connect(DB_PATH)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA foreign_keys = ON')
+        if USE_POSTGRES:
+            db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            cursor = db.cursor()
+            
+            cursor.execute('SELECT COUNT(*) as c FROM users')
+            count = cursor.fetchone()['c']
+            if count > 0:
+                cursor.close()
+                db.close()
+                return
 
-        count = db.execute('SELECT COUNT(*) as c FROM users').fetchone()['c']
-        if count > 0:
+            print('🌱 Seeding demo data...')
+            hash_pw = lambda p: bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+
+            users_data = [
+                ('Alex Admin', 'admin@taskflow.com', hash_pw('password123'), 'admin', 'AA|#6366f1'),
+                ('Sam Developer', 'sam@taskflow.com', hash_pw('password123'), 'member', 'SD|#10b981'),
+                ('Jordan Designer', 'jordan@taskflow.com', hash_pw('password123'), 'member', 'JD|#ec4899'),
+            ]
+            for u in users_data:
+                cursor.execute('INSERT INTO users (name,email,password,role,avatar) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (email) DO NOTHING', u)
+            db.commit()
+
+            cursor.execute("SELECT id FROM users WHERE email='admin@taskflow.com'")
+            admin_id = cursor.fetchone()['id']
+            cursor.execute("SELECT id FROM users WHERE email='sam@taskflow.com'")
+            sam_id = cursor.fetchone()['id']
+            cursor.execute("SELECT id FROM users WHERE email='jordan@taskflow.com'")
+            jordan_id = cursor.fetchone()['id']
+
+            cursor.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (%s,%s,%s,%s) RETURNING id',
+                ('Website Redesign', 'Complete redesign of the company website with modern stack', '#6366f1', admin_id))
+            p1 = cursor.fetchone()['id']
+            cursor.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (%s,%s,%s,%s) RETURNING id',
+                ('Mobile App v2.0', 'New version of the mobile app with improved UX', '#ec4899', admin_id))
+            p2 = cursor.fetchone()['id']
+            db.commit()
+
+            for pid, uid, role in [(p1,admin_id,'admin'),(p1,sam_id,'member'),(p1,jordan_id,'member'),
+                                    (p2,admin_id,'admin'),(p2,jordan_id,'admin')]:
+                cursor.execute('INSERT INTO project_members (project_id,user_id,role) VALUES (%s,%s,%s) ON CONFLICT (project_id, user_id) DO NOTHING', (pid,uid,role))
+
+            from datetime import date, timedelta
+            today = date.today()
+            tasks = [
+                ('Design new homepage wireframes','Create wireframes for all key sections','done','high',p1,jordan_id,admin_id,str(today-timedelta(2))),
+                ('Implement hero section','Build hero section with animations','in_progress','high',p1,sam_id,admin_id,str(today+timedelta(5))),
+                ('Write API documentation','Document all REST endpoints','todo','medium',p1,sam_id,admin_id,str(today+timedelta(10))),
+                ('Fix navigation bug on mobile','Hamburger menu broken on iOS Safari','review','urgent',p1,jordan_id,admin_id,str(today-timedelta(1))),
+                ('SEO optimization','Add meta tags, sitemap, structured data','todo','low',p1,None,sam_id,str(today+timedelta(14))),
+                ('User onboarding flow redesign','Redesign the 3-step onboarding','in_progress','high',p2,jordan_id,admin_id,str(today-timedelta(3))),
+                ('Push notifications setup','Integrate Firebase for push notifications','todo','urgent',p2,None,admin_id,None),
+                ('Dark mode implementation','Add system-level dark mode support','todo','medium',p2,sam_id,jordan_id,str(today+timedelta(7))),
+            ]
+            for t in tasks:
+                cursor.execute('INSERT INTO tasks (title,description,status,priority,project_id,assignee_id,creator_id,due_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)', t)
+
+            db.commit()
+            cursor.close()
             db.close()
-            return
+            print('✅ Seed complete')
+        else:
+            # SQLite version
+            db = sqlite3.connect(DB_PATH)
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA foreign_keys = ON')
 
-        print('🌱 Seeding demo data...')
-        hash_pw = lambda p: bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+            count = db.execute('SELECT COUNT(*) as c FROM users').fetchone()['c']
+            if count > 0:
+                db.close()
+                return
 
-        users_data = [
-            ('Alex Admin', 'admin@taskflow.com', hash_pw('password123'), 'admin', 'AA|#6366f1'),
-            ('Sam Developer', 'sam@taskflow.com', hash_pw('password123'), 'member', 'SD|#10b981'),
-            ('Jordan Designer', 'jordan@taskflow.com', hash_pw('password123'), 'member', 'JD|#ec4899'),
-        ]
-        for u in users_data:
-            db.execute('INSERT OR IGNORE INTO users (name,email,password,role,avatar) VALUES (?,?,?,?,?)', u)
-        db.commit()
+            print('🌱 Seeding demo data...')
+            hash_pw = lambda p: bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
 
-        admin_id = db.execute("SELECT id FROM users WHERE email='admin@taskflow.com'").fetchone()['id']
-        sam_id = db.execute("SELECT id FROM users WHERE email='sam@taskflow.com'").fetchone()['id']
-        jordan_id = db.execute("SELECT id FROM users WHERE email='jordan@taskflow.com'").fetchone()['id']
+            users_data = [
+                ('Alex Admin', 'admin@taskflow.com', hash_pw('password123'), 'admin', 'AA|#6366f1'),
+                ('Sam Developer', 'sam@taskflow.com', hash_pw('password123'), 'member', 'SD|#10b981'),
+                ('Jordan Designer', 'jordan@taskflow.com', hash_pw('password123'), 'member', 'JD|#ec4899'),
+            ]
+            for u in users_data:
+                db.execute('INSERT OR IGNORE INTO users (name,email,password,role,avatar) VALUES (?,?,?,?,?)', u)
+            db.commit()
 
-        p1 = db.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (?,?,?,?)',
-            ('Website Redesign', 'Complete redesign of the company website with modern stack', '#6366f1', admin_id)
-        ).lastrowid
-        p2 = db.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (?,?,?,?)',
-            ('Mobile App v2.0', 'New version of the mobile app with improved UX', '#ec4899', admin_id)
-        ).lastrowid
-        db.commit()
+            admin_id = db.execute("SELECT id FROM users WHERE email='admin@taskflow.com'").fetchone()['id']
+            sam_id = db.execute("SELECT id FROM users WHERE email='sam@taskflow.com'").fetchone()['id']
+            jordan_id = db.execute("SELECT id FROM users WHERE email='jordan@taskflow.com'").fetchone()['id']
 
-        for pid, uid, role in [(p1,admin_id,'admin'),(p1,sam_id,'member'),(p1,jordan_id,'member'),
-                                (p2,admin_id,'admin'),(p2,jordan_id,'admin')]:
-            db.execute('INSERT OR IGNORE INTO project_members (project_id,user_id,role) VALUES (?,?,?)', (pid,uid,role))
+            p1 = db.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (?,?,?,?)',
+                ('Website Redesign', 'Complete redesign of the company website with modern stack', '#6366f1', admin_id)
+            ).lastrowid
+            p2 = db.execute('INSERT INTO projects (name,description,color,owner_id) VALUES (?,?,?,?)',
+                ('Mobile App v2.0', 'New version of the mobile app with improved UX', '#ec4899', admin_id)
+            ).lastrowid
+            db.commit()
 
-        from datetime import date, timedelta
-        today = date.today()
-        tasks = [
-            ('Design new homepage wireframes','Create wireframes for all key sections','done','high',p1,jordan_id,admin_id,str(today-timedelta(2))),
-            ('Implement hero section','Build hero section with animations','in_progress','high',p1,sam_id,admin_id,str(today+timedelta(5))),
-            ('Write API documentation','Document all REST endpoints','todo','medium',p1,sam_id,admin_id,str(today+timedelta(10))),
-            ('Fix navigation bug on mobile','Hamburger menu broken on iOS Safari','review','urgent',p1,jordan_id,admin_id,str(today-timedelta(1))),
-            ('SEO optimization','Add meta tags, sitemap, structured data','todo','low',p1,None,sam_id,str(today+timedelta(14))),
-            ('User onboarding flow redesign','Redesign the 3-step onboarding','in_progress','high',p2,jordan_id,admin_id,str(today-timedelta(3))),
-            ('Push notifications setup','Integrate Firebase for push notifications','todo','urgent',p2,None,admin_id,None),
-            ('Dark mode implementation','Add system-level dark mode support','todo','medium',p2,sam_id,jordan_id,str(today+timedelta(7))),
-        ]
-        for t in tasks:
-            db.execute('INSERT INTO tasks (title,description,status,priority,project_id,assignee_id,creator_id,due_date) VALUES (?,?,?,?,?,?,?,?)', t)
+            for pid, uid, role in [(p1,admin_id,'admin'),(p1,sam_id,'member'),(p1,jordan_id,'member'),
+                                    (p2,admin_id,'admin'),(p2,jordan_id,'admin')]:
+                db.execute('INSERT OR IGNORE INTO project_members (project_id,user_id,role) VALUES (?,?,?)', (pid,uid,role))
 
-        db.commit()
-        db.close()
-        print('✅ Seed complete')
+            from datetime import date, timedelta
+            today = date.today()
+            tasks = [
+                ('Design new homepage wireframes','Create wireframes for all key sections','done','high',p1,jordan_id,admin_id,str(today-timedelta(2))),
+                ('Implement hero section','Build hero section with animations','in_progress','high',p1,sam_id,admin_id,str(today+timedelta(5))),
+                ('Write API documentation','Document all REST endpoints','todo','medium',p1,sam_id,admin_id,str(today+timedelta(10))),
+                ('Fix navigation bug on mobile','Hamburger menu broken on iOS Safari','review','urgent',p1,jordan_id,admin_id,str(today-timedelta(1))),
+                ('SEO optimization','Add meta tags, sitemap, structured data','todo','low',p1,None,sam_id,str(today+timedelta(14))),
+                ('User onboarding flow redesign','Redesign the 3-step onboarding','in_progress','high',p2,jordan_id,admin_id,str(today-timedelta(3))),
+                ('Push notifications setup','Integrate Firebase for push notifications','todo','urgent',p2,None,admin_id,None),
+                ('Dark mode implementation','Add system-level dark mode support','todo','medium',p2,sam_id,jordan_id,str(today+timedelta(7))),
+            ]
+            for t in tasks:
+                db.execute('INSERT INTO tasks (title,description,status,priority,project_id,assignee_id,creator_id,due_date) VALUES (?,?,?,?,?,?,?,?)', t)
+
+            db.commit()
+            db.close()
+            print('✅ Seed complete')
 
 if __name__ == '__main__':
     init_db()
