@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, date
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
-from urllib.parse import urlparse
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)
@@ -21,12 +20,20 @@ JWT_ALGO = 'HS256'
 # Determine database type
 USE_POSTGRES = DATABASE_URL is not None
 
+# Import PostgreSQL driver if needed
 if USE_POSTGRES:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    # Fix Railway's postgres:// to postgresql://
-    if DATABASE_URL.startswith('postgres://'):
-        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        # Fix Railway's postgres:// to postgresql://
+        if DATABASE_URL.startswith('postgres://'):
+            DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        print(f'✓ Using PostgreSQL database')
+    except ImportError:
+        print('✗ psycopg2 not installed, falling back to SQLite')
+        USE_POSTGRES = False
+else:
+    print(f'✓ Using SQLite database: {DB_PATH}')
 
 # ─── DB ────────────────────────────────────────────────────────────────────
 def get_db():
@@ -40,6 +47,39 @@ def get_db():
             g.db.execute('PRAGMA foreign_keys = ON')
             g.db.execute('PRAGMA journal_mode = WAL')
     return g.db
+
+def execute_query(query, params=None, fetch_one=False, fetch_all=False):
+    """Execute query with proper syntax for both SQLite and PostgreSQL"""
+    db = get_db()
+    
+    if USE_POSTGRES:
+        # PostgreSQL: convert ? to %s
+        query = query.replace('?', '%s')
+        cursor = db.cursor()
+        cursor.execute(query, params or ())
+        
+        if fetch_one:
+            result = cursor.fetchone()
+            cursor.close()
+            return result
+        elif fetch_all:
+            result = cursor.fetchall()
+            cursor.close()
+            return result
+        else:
+            last_id = cursor.lastrowid if hasattr(cursor, 'lastrowid') else None
+            cursor.close()
+            return last_id
+    else:
+        # SQLite
+        cursor = db.execute(query, params or ())
+        
+        if fetch_one:
+            return cursor.fetchone()
+        elif fetch_all:
+            return cursor.fetchall()
+        else:
+            return cursor.lastrowid
 
 @app.teardown_appcontext
 def close_db(e=None):
@@ -192,10 +232,13 @@ def authenticate(f):
         except Exception:
             return jsonify({'error': 'Invalid token'}), 401
 
-        db = get_db()
-        user = row_to_dict(db.execute(
-            'SELECT id,name,email,role,avatar,created_at FROM users WHERE id=?', (payload['id'],)
-        ).fetchone())
+        user = execute_query(
+            'SELECT id,name,email,role,avatar,created_at FROM users WHERE id=?',
+            (payload['id'],),
+            fetch_one=True
+        )
+        user = row_to_dict(user)
+        
         if not user:
             return jsonify({'error': 'User not found'}), 401
         g.user = user
@@ -245,10 +288,15 @@ def signup():
         return jsonify({'error': 'Invalid email format'}), 400
 
     db = get_db()
-    if db.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone():
+    
+    # Check if email exists
+    existing = execute_query('SELECT id FROM users WHERE email=?', (email,), fetch_one=True)
+    if existing:
         return jsonify({'error': 'Email already registered'}), 409
 
-    count = db.execute('SELECT COUNT(*) as c FROM users').fetchone()['c']
+    # Get user count
+    count_result = execute_query('SELECT COUNT(*) as c FROM users', fetch_one=True)
+    count = count_result['c']
     user_role = 'admin' if count == 0 else role
 
     initials = ''.join(w[0] for w in name.split() if w).upper()[:2]
@@ -256,13 +304,25 @@ def signup():
     avatar = f"{initials}|{random.choice(colors)}"
 
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    cursor = db.execute(
-        'INSERT INTO users (name,email,password,role,avatar) VALUES (?,?,?,?,?)',
-        (name, email, hashed, user_role, avatar)
-    )
+    
+    if USE_POSTGRES:
+        cursor = db.cursor()
+        cursor.execute(
+            'INSERT INTO users (name,email,password,role,avatar) VALUES (%s,%s,%s,%s,%s) RETURNING id',
+            (name, email, hashed, user_role, avatar)
+        )
+        user_id = cursor.fetchone()['id']
+        cursor.close()
+    else:
+        cursor = db.execute(
+            'INSERT INTO users (name,email,password,role,avatar) VALUES (?,?,?,?,?)',
+            (name, email, hashed, user_role, avatar)
+        )
+        user_id = cursor.lastrowid
+    
     db.commit()
 
-    user = {'id': cursor.lastrowid, 'name': name, 'email': email, 'role': user_role, 'avatar': avatar}
+    user = {'id': user_id, 'name': name, 'email': email, 'role': user_role, 'avatar': avatar}
     token = make_token(user['id'])
     return jsonify({'user': user, 'token': token}), 201
 
@@ -274,8 +334,9 @@ def login():
     if not email or not password:
         return jsonify({'error': 'Email and password are required'}), 400
 
-    db = get_db()
-    user = row_to_dict(db.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone())
+    user = execute_query('SELECT * FROM users WHERE email=?', (email,), fetch_one=True)
+    user = row_to_dict(user)
+    
     if not user or not bcrypt.checkpw(password.encode(), user['password'].encode()):
         return jsonify({'error': 'Invalid credentials'}), 401
 
@@ -633,7 +694,27 @@ def dashboard():
 # ─── HEALTH ─────────────────────────────────────────────────────────────────
 @app.route('/api/health')
 def health():
-    return jsonify({'status': 'ok', 'time': datetime.utcnow().isoformat()})
+    db_status = 'postgresql' if USE_POSTGRES else 'sqlite'
+    db_connected = False
+    try:
+        db = get_db()
+        cursor = db.cursor() if USE_POSTGRES else db
+        if USE_POSTGRES:
+            cursor.execute('SELECT 1')
+            cursor.close()
+        else:
+            cursor.execute('SELECT 1').fetchone()
+        db_connected = True
+    except Exception as e:
+        db_connected = False
+    
+    return jsonify({
+        'status': 'ok',
+        'time': datetime.utcnow().isoformat(),
+        'database': db_status,
+        'db_connected': db_connected,
+        'has_database_url': DATABASE_URL is not None
+    })
 
 # ─── SPA FALLBACK ────────────────────────────────────────────────────────────
 @app.route('/', defaults={'path': ''})
