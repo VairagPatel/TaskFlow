@@ -28,12 +28,12 @@ if USE_POSTGRES:
         # Fix Railway's postgres:// to postgresql://
         if DATABASE_URL.startswith('postgres://'):
             DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-        print(f'✓ Using PostgreSQL database')
+        print(f'✅ Using PostgreSQL database (production)')
     except ImportError:
-        print('✗ psycopg2 not installed, falling back to SQLite')
+        print('⚠️  psycopg2 not installed, falling back to SQLite')
         USE_POSTGRES = False
 else:
-    print(f'✓ Using SQLite database: {DB_PATH}')
+    print(f'✅ Using SQLite database (local): {DB_PATH}')
 
 # ─── DB ────────────────────────────────────────────────────────────────────
 def get_db():
